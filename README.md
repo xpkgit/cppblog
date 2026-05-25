@@ -42,7 +42,7 @@
 ### 1. Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/cppblog.git
+git clone https://github.com/xpkgit/cppblog.git
 cd cppblog
 ```
 
