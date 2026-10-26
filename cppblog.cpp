@@ -1,5 +1,5 @@
 /**
- * C++ CGI博客程序 - 发博客/编辑博客/回复审核
+ * C++ CGI论坛程序 - 发博客/编辑博客/回复审核
  * 使用文件存储数据
  */
 
@@ -10,13 +10,28 @@
 #include <ctime>
 #include <vector>
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
 
 using namespace std;
 
 const string DATA_DIR = "/usr/lib/cppblog/";
+const string SESSION_DIR = DATA_DIR + "sessions/";
 const string POSTS_FILE = DATA_DIR + "/cppblog.md";
 const string ADMIN_PASSWORD = "YOUR_ADMIN_PASSWORD_HERE";  // TODO: 部署前替换为强密码，勿提交真实密码到版本库
+
+// 会话有效期（秒）
+const long SESSION_TTL = 7200;
+
+// POST请求主体大小上限（字节），防止无界读取导致内存耗尽
+const size_t MAX_BODY = 1048576;
+
+// 本次响应需要下发的Cookie（用于会话token）
+vector<string> g_outCookies;
 
 // 获取环境变量
 const char* env(const char* name) {
@@ -28,10 +43,15 @@ string decode(const string& s) {
     string r;
     for (size_t i = 0; i < s.length(); ++i) {
         if (s[i] == '%' && i + 2 < s.length()) {
-            int v;
-            sscanf(s.c_str() + i + 1, "%2x", &v);
-            r += char(v);
-            i += 2;
+            int v = 0;                       // 初始化，避免读取未定义值
+            // 仅当后两位确为十六进制且成功解析时才解码，否则原样保留
+            if (isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2])
+                && sscanf(s.c_str() + i + 1, "%2x", &v) == 1) {
+                r += char(v);
+                i += 2;
+            } else {
+                r += s[i];
+            }
         } else if (s[i] == '+') {
             r += ' ';
         } else {
@@ -52,6 +72,18 @@ string escape(const string& s) {
         else r += c;
     }
     return r;
+}
+
+// 校验链接URL安全：仅放行 http/https/mailto 与站内相对路径，阻断 javascript:/data: 等XSS协议
+bool isSafeUrl(const string& rawUrl) {
+    string url = decode(rawUrl);        // 解码后再判断，防止 javascript%3A 之类绕过
+    if (url.empty()) return true;
+    string lower;
+    for (size_t i = 0; i < url.length(); ++i) lower += (char)tolower((unsigned char)url[i]);
+    size_t schemeEnd = lower.find(':');
+    if (schemeEnd == string::npos) return true;   // 无协议头部，视为相对路径/锚点
+    string scheme = lower.substr(0, schemeEnd);
+    return (scheme == "http" || scheme == "https" || scheme == "mailto");
 }
 
 // 简单的Markdown转HTML
@@ -102,19 +134,7 @@ string md2html(const string& md) {
         }
     }
     
-    // 链接 [text](url)
-    pos = 0;
-    while ((pos = s.find("[", pos)) != string::npos) {
-        size_t end = s.find("](", pos);
-        size_t urlEnd = s.find(")", end + 2);
-        if (end == string::npos || urlEnd == string::npos) break;
-        string text = s.substr(pos + 1, end - pos - 1);
-        string url = s.substr(end + 2, urlEnd - end - 2);
-        s.replace(pos, urlEnd - pos + 1, "<a href=\"" + url + "\" target=\"_blank\">" + text + "</a>");
-        pos = urlEnd + 1;
-    }
-    
-    // 图片 ![alt](url)
+    // 图片 ![alt](url) —— 必须先于链接规则处理，否则 "![" 会被链接规则提前吞掉导致图片永不渲染
     pos = 0;
     while ((pos = s.find("![", pos)) != string::npos) {
         size_t end = s.find("](", pos);
@@ -122,7 +142,31 @@ string md2html(const string& md) {
         if (end == string::npos || urlEnd == string::npos) break;
         string alt = s.substr(pos + 2, end - pos - 2);
         string url = s.substr(end + 2, urlEnd - end - 2);
-        s.replace(pos, urlEnd - pos + 1, "<img src=\"" + url + "\" alt=\"" + alt + "\" style=\"max-width:100%;\">");
+        if (!isSafeUrl(url)) {
+            // 危险协议：降级为纯文本，杜绝 <img onerror> 类事件注入
+            s.replace(pos, urlEnd - pos + 1, "<span>[" + alt + "]</span>");
+        } else {
+            s.replace(pos, urlEnd - pos + 1, "<img src=\"" + url + "\" alt=\"" + alt + "\" style=\"max-width:100%;\">");
+        }
+        pos = urlEnd + 1;
+    }
+
+    // 链接 [text](url)
+    pos = 0;
+    while ((pos = s.find("[", pos)) != string::npos) {
+        size_t end = s.find("](", pos);
+        size_t urlEnd = s.find(")", end + 2);
+        if (end == string::npos || urlEnd == string::npos) break;
+        // 跳过已渲染的图片/链接内部产生的方括号，避免二次解析
+        size_t lt = s.rfind('<', pos);
+        if (lt != string::npos) {
+            size_t gt = s.find('>', lt);
+            if (gt != string::npos && gt > pos) { pos = gt + 1; continue; }
+        }
+        string text = s.substr(pos + 1, end - pos - 1);
+        string url = s.substr(end + 2, urlEnd - end - 2);
+        if (!isSafeUrl(url)) url = "#";          // 阻断 javascript:/data: 等危险协议
+        s.replace(pos, urlEnd - pos + 1, "<a href=\"" + url + "\" target=\"_blank\" rel=\"noopener noreferrer\">" + text + "</a>");
         pos = urlEnd + 1;
     }
     
@@ -182,21 +226,39 @@ string md2html(const string& md) {
     return result;
 }
 
-// 解析参数
+// 解析参数：按 & 分段后严格比对键名，杜绝 "xa=1" 被当作 "a=1" 的前缀劫持
 string getq(const string& qs, const string& key) {
     string d = decode(qs);
     string k = key + "=";
-    size_t p = d.find(k);
-    if (p == string::npos) {
-        k = "&" + key + "=";
-        p = d.find(k);
-        if (p == string::npos) return "";
-        p++;
+    size_t start = 0;
+    while (start <= d.length()) {
+        size_t amp = d.find('&', start);
+        size_t end = (amp == string::npos) ? d.length() : amp;
+        string seg = d.substr(start, end - start);
+        // 段首必须精确等于 key=，避免其它参数名以其为后缀时误命中
+        if (seg.length() >= k.length() && seg.compare(0, k.length(), k) == 0) {
+            return seg.substr(k.length());
+        }
+        if (amp == string::npos) break;
+        start = amp + 1;
     }
-    p += key.length() + 1;
-    size_t e = d.find('&', p);
-    if (e == string::npos) e = d.length();
-    return d.substr(p, e - p);
+    return "";
+}
+
+// 读取POST请求主体：依据CONTENT_LENGTH限量读取，避免无界内存消耗(DoS)
+string readPostBody(size_t maxBytes) {
+    string body;
+    const char* cl = env("CONTENT_LENGTH");
+    long len = (cl && *cl) ? atol(cl) : 0;
+    if (len <= 0) return body;
+    if ((size_t)len > maxBytes) len = (long)maxBytes;   // 超限部分直接丢弃
+    body.reserve((size_t)len);
+    for (long i = 0; i < len; ++i) {
+        int ch = cin.get();
+        if (ch == EOF) break;
+        body += (char)ch;
+    }
+    return body;
 }
 
 // 获取当前时间
@@ -213,6 +275,173 @@ string genId() {
     stringstream ss;
     ss << t << (rand() % 10000);
     return ss.str();
+}
+
+// ============ 安全加固：输入校验 / 会话管理 ============
+
+// 校验帖子ID合法：仅允许纯数字，杜绝路径穿越与命令注入
+bool isValidId(const string& id) {
+    if (id.empty() || id.length() > 32) return false;
+    for (size_t i = 0; i < id.length(); ++i) {
+        if (!isdigit((unsigned char)id[i])) return false;
+    }
+    return true;
+}
+
+// 清洗用户输入：去除换行与管道符，防止存储格式(行记录)注入
+string sanitizeField(const string& s) {
+    string r;
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        if (c == '\n' || c == '\r' || c == '|') r += ' ';
+        else r += c;
+    }
+    return r;
+}
+
+// 清洗正文：保留 Markdown 换行，仅剔除记录分隔符 '|'
+string sanitizeContent(const string& s) {
+    string r;
+    for (size_t i = 0; i < s.length(); ++i) {
+        char c = s[i];
+        if (c == '|') r += ' ';
+        else r += c;
+    }
+    return r;
+}
+
+// 由帖子ID推导回复文件路径（已校验合法性）
+bool replyFilePath(const string& postId, string& outPath) {
+    if (!isValidId(postId)) return false;
+    outPath = DATA_DIR + "reply_" + postId + ".txt";
+    return true;
+}
+
+// 容错清理ID：只保留数字与下划线，遇到其它字符即截断
+// 用于应对 "id=123?lang=en" 这类把第二个分隔符误写成 ? 的URL
+string normalizeId(const string& raw) {
+    string r;
+    for (size_t i = 0; i < raw.length(); ++i) {
+        char c = raw[i];
+        if ((c >= '0' && c <= '9') || c == '_') r += c;
+        else break;
+    }
+    return r;
+}
+
+// 读取Cookie中的指定字段：按 ';' 分段严格匹配键名，防止 xcppblog_sid 之类的前缀劫持
+string getCookieValue(const char* name) {
+    const char* raw = env("HTTP_COOKIE");
+    if (!raw) return "";
+    string cookie = raw;
+    string n = string(name) + "=";
+    size_t start = 0;
+    while (start <= cookie.length()) {
+        size_t sep = cookie.find(';', start);
+        size_t end = (sep == string::npos) ? cookie.length() : sep;
+        string seg = cookie.substr(start, end - start);
+        size_t b = 0;
+        while (b < seg.length() && seg[b] == ' ') b++;   // 去除前导空格
+        seg = seg.substr(b);
+        if (seg.length() > n.length() && seg.compare(0, n.length(), n) == 0) {
+            return decode(seg.substr(n.length()));
+        }
+        if (sep == string::npos) break;
+        start = sep + 1;
+    }
+    return "";
+}
+
+// 校验会话token自身格式（防止拼路径）
+bool isWellFormedToken(const string& token) {
+    if (token.length() != 32) return false;
+    for (size_t i = 0; i < token.length(); ++i) {
+        char c = token[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+// 生成随机会话token
+string genToken() {
+    ifstream urandom("/dev/urandom", ios::binary);
+    if (urandom) {
+        static const char hexChars[] = "0123456789abcdef";
+        string token;
+        for (int i = 0; i < 32; ++i) {
+            unsigned char b = 0;
+            urandom.read((char*)&b, 1);
+            token += hexChars[b % 16];
+        }
+        return token;
+    }
+    // 回退方案：时间+进程+随机数混合
+    stringstream ss;
+    ss << hex << time(NULL) << clock() << getpid() << rand();
+    string token = ss.str();
+    while (token.length() < 32) token += '0';
+    return token.substr(0, 32);
+}
+
+// 创建服务端会话，返回token（密码不再出现在URL中）
+// 使用 O_CREAT|O_EXCL 排他创建 + 0600权限，避免覆盖他人会话或会话文件被同主机其它用户读取
+string createSession() {
+    mkdir(SESSION_DIR.c_str(), 0700);
+    string token;
+    for (int i = 0; i < 8; ++i) {
+        token = genToken();
+        string path = SESSION_DIR + token;
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            string ts = to_string((long)time(NULL)) + "\n";
+            write(fd, ts.c_str(), ts.length());
+            close(fd);
+            return token;
+        }
+    }
+    return token;
+}
+
+// 校验会话是否有效（含过期清理）
+bool isValidSession(const string& token) {
+    if (!isWellFormedToken(token)) return false;
+    string path = SESSION_DIR + token;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    ifstream f(path.c_str());
+    long created = 0;
+    f >> created;
+    if (created <= 0) return false;
+    long age = (long)time(NULL) - created;
+    if (age < 0) age = -age;
+    if (age > SESSION_TTL) {
+        f.close();
+        unlink(path.c_str());
+        return false;
+    }
+    return true;
+}
+
+// 销毁会话
+void destroySession(const string& token) {
+    if (!isWellFormedToken(token)) return;
+    unlink((SESSION_DIR + token).c_str());
+}
+
+// 当前请求是否为已登录管理员
+bool isAdminAuthed() {
+    return isValidSession(getCookieValue("cppblog_sid"));
+}
+
+// 下发HttpOnly会话Cookie
+void setSessionCookie(const string& token) {
+    g_outCookies.push_back("Set-Cookie: cppblog_sid=" + token +
+                           "; Path=/; HttpOnly; SameSite=Strict\r\n");
+}
+
+// 使会话Cookie失效
+void clearSessionCookie() {
+    g_outCookies.push_back("Set-Cookie: cppblog_sid=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\n");
 }
 
 // 帖子结构
@@ -280,9 +509,14 @@ void savePosts(const vector<Post>& posts) {
 
 // 添加回复 - 默认待审核
 void addReply(const string& postId, const string& author, const string& content) {
-    string replyFile = DATA_DIR + "/reply_" + postId + ".txt";
-    ofstream f(replyFile, ios::app);
-    f << genId() << "|" << author << "|" << content << "|" << now() << "|pending|" << endl;
+    string replyFile;
+    if (!replyFilePath(postId, replyFile)) return;      // 非法ID，拒绝写入
+    string safeAuthor = sanitizeField(author);
+    string safeContent = sanitizeField(content);
+    if (safeAuthor.empty()) safeAuthor = "匿名";
+    if (safeContent.empty()) return;
+    ofstream f(replyFile.c_str(), ios::app);
+    f << genId() << "|" << safeAuthor << "|" << safeContent << "|" << now() << "|pending|" << endl;
 }
 
 // 加载回复 - 参数: postId, showPending(是否显示待审核)
@@ -292,8 +526,9 @@ struct Reply {
 
 vector<Reply> loadReplies(const string& postId, bool approvedOnly = true) {
     vector<Reply> replies;
-    string replyFile = DATA_DIR + "/reply_" + postId + ".txt";
-    ifstream f(replyFile);
+    string replyFile;
+    if (!replyFilePath(postId, replyFile)) return replies;   // 非法ID，返回空列表
+    ifstream f(replyFile.c_str());
     string line;
     while (getline(f, line)) {
         if (!line.empty()) {
@@ -332,16 +567,30 @@ void updateReplyCount(const string& postId) {
     savePosts(posts);
 }
 
+// 列出所有回复文件路径：改用目录遍历，替代 popen("ls") 外部命令
+vector<string> listReplyFiles() {
+    vector<string> files;
+    DIR* dir = opendir(DATA_DIR.c_str());
+    if (!dir) return files;
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != NULL) {
+        string name = ent->d_name;
+        if (name.compare(0, 6, "reply_") == 0 && name.length() > 4 &&
+            name.compare(name.length() - 4, 4, ".txt") == 0) {
+            files.push_back(DATA_DIR + name);
+        }
+    }
+    closedir(dir);
+    return files;
+}
+
 // 加载所有待审核的回复
 vector<Reply> loadAllPendingReplies() {
     vector<Reply> allReplies;
-    string cmd = "ls " + DATA_DIR + "/reply_*.txt 2>/dev/null";
-    FILE* fp = popen(cmd.c_str(), "r");
-    if (fp) {
-        char buf[256];
-        while (fgets(buf, sizeof(buf), fp)) {
-            string f = buf;
-            f = f.substr(0, f.find('\n'));
+    vector<string> replyFiles = listReplyFiles();
+    for (size_t fi = 0; fi < replyFiles.size(); ++fi) {
+        {
+            string f = replyFiles[fi];
             ifstream rf(f);
             string line;
             while (getline(rf, line)) {
@@ -371,7 +620,6 @@ vector<Reply> loadAllPendingReplies() {
             }
             rf.close();
         }
-        pclose(fp);
     }
     return allReplies;
 }
@@ -382,8 +630,9 @@ void approveReply(const string& replyFullId) {
     if (sep == string::npos) return;
     string postId = replyFullId.substr(0, sep);
     string replyId = replyFullId.substr(sep + 1);
-    string replyFile = DATA_DIR + "/reply_" + postId + ".txt";
-    
+    string replyFile;
+    if (!replyFilePath(postId, replyFile)) return;      // 非法ID，拒绝操作
+
     ifstream rf(replyFile);
     vector<string> lines;
     string line;
@@ -412,8 +661,9 @@ void deleteReply(const string& replyFullId) {
     if (sep == string::npos) return;
     string postId = replyFullId.substr(0, sep);
     string replyId = replyFullId.substr(sep + 1);
-    string replyFile = DATA_DIR + "/reply_" + postId + ".txt";
-    
+    string replyFile;
+    if (!replyFilePath(postId, replyFile)) return;      // 非法ID，拒绝操作
+
     ifstream rf(replyFile);
     vector<string> lines;
     string line;
@@ -432,11 +682,12 @@ void deleteReply(const string& replyFullId) {
 
 // 更新博客
 void updatePost(const string& id, const string& title, const string& content) {
+    if (!isValidId(id)) return;          // 非法ID，拒绝修改
     vector<Post> posts = loadPosts();
     for (auto& p : posts) {
         if (p.id == id) {
-            p.title = title;
-            p.content = content;
+            p.title = sanitizeField(title);
+            p.content = sanitizeContent(content);
             break;
         }
     }
@@ -445,6 +696,7 @@ void updatePost(const string& id, const string& title, const string& content) {
 
 // 删除博客
 void deleteBlog(const string& id) {
+    if (!isValidId(id)) return;          // ID非法即拒绝，阻断命令注入与路径穿越
     vector<Post> posts = loadPosts();
     vector<Post> newPosts;
     for (auto& p : posts) {
@@ -453,24 +705,32 @@ void deleteBlog(const string& id) {
         }
     }
     savePosts(newPosts);
-    // 删除该博客的回复文件
-    string cmd = "rm -f " + DATA_DIR + "/reply_" + id + ".txt";
-    system(cmd.c_str());
+    // 删除该博客的回复文件：直接调用unlink，杜绝shell命令拼接
+    string replyFile = DATA_DIR + "reply_" + id + ".txt";
+    unlink(replyFile.c_str());
 }
 
 void deleteAllPosts() {
     // 清空所有帖子
     ofstream f(POSTS_FILE, ios::trunc);
     f.close();
-    // 删除所有回复文件
-    string cmd = "rm -f " + DATA_DIR + "/reply_*.txt";
-    system(cmd.c_str());
+    // 删除所有回复文件：遍历目录逐个unlink，替代 system("rm -f") 外部命令
+    vector<string> replyFiles = listReplyFiles();
+    for (size_t i = 0; i < replyFiles.size(); ++i) {
+        unlink(replyFiles[i].c_str());
+    }
 }
 
 // HTML页面 - Material-UI浅色极简风格
 void html(const string& title, const string& lang, const string& content) {
     string langSwitch = (lang == "en") ? "<a href=\"?lang=zh\" style=\"position:fixed;top:16px;right:20px;padding:6px 12px;background:#fff;border-radius:4px;text-decoration:none;color:#1976d2;font-size:0.85rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);\">中文</a>" : "<a href=\"?lang=en\" style=\"position:fixed;top:16px;right:20px;padding:6px 12px;background:#fff;border-radius:4px;text-decoration:none;color:#1976d2;font-size:0.85rem;box-shadow:0 1px 3px rgba(0,0,0,0.1);\">English</a>";
-    cout << "Content-type: text/html; charset=utf-8\r\n\r\n";
+    cout << "Content-type: text/html; charset=utf-8\r\n";
+    cout << "Cache-Control: no-store\r\n";           // 管理页面禁止缓存
+    cout << "X-Content-Type-Options: nosniff\r\n";
+    cout << "X-Frame-Options: SAMEORIGIN\r\n";       // 防点击劫持
+    cout << "Referrer-Policy: no-referrer\r\n";      // 避免URL经Referer外泄
+    for (size_t i = 0; i < g_outCookies.size(); ++i) cout << g_outCookies[i];
+    cout << "\r\n";
     cout << R"(<!DOCTYPE html>
 <html lang=")" << (lang == "en" ? "en" : "zh-CN") << R"(">
 <head>
@@ -580,7 +840,9 @@ string renderList(const vector<Post>& posts, const string& lang = "zh") {
         ss << "<div class=\"post\">";
         ss << "<div class=\"post-title\">" << escape(p.title) << "</div>";
         ss << "<div class=\"post-meta\">" << p.time << " &middot; " << escape(p.author) << "</div>";
-        ss << "<div class=\"post-content\">" << md2html(p.content).substr(0, 300);
+        // 先在Markdown源层面截断再渲染，避免在HTML中间切断标签导致结构破损
+        string summarySrc = p.content.length() > 300 ? p.content.substr(0, 300) : p.content;
+        ss << "<div class=\"post-content\">" << md2html(summarySrc);
         if (p.content.length() > 300) ss << "...";
         ss << "</div>";
         ss << "<div class=\"actions\">";
@@ -697,7 +959,7 @@ string renderEditForm(const string& id, const string& lang = "zh") {
     ss << "<div class=\"nav\"><a href=\"/?lang=" << lang << "\">" << tBlog << "</a><a href=\"?a=admin&lang=" << lang << "\">" << tAdmin << "</a></div>";
     ss << "<div class=\"post\">";
     ss << "<form action=\"?a=update&lang=" << lang << "\" method=\"post\" id=\"editForm\">";
-    ss << "<input type=\"hidden\" name=\"id\" value=\"" << id << "\">";
+    ss << "<input type=\"hidden\" name=\"id\" value=\"" << escape(id) << "\">";
     ss << "<div style=\"margin-bottom:20px\">";
     ss << "<label>" << tLabelTitle << "</label>";
     ss << "<input name=\"title\" id=\"edit-title\" value=\"" << escape(pPtr->title) << "\" required>";
@@ -722,8 +984,8 @@ string renderSubmit(const string& title, const string& author, const string& con
     Post p;
     p.id = genId();
     p.title = title;
-    p.author = author.empty() ? "博主" : author;
-    p.content = content;
+    p.author = author.empty() ? "博主" : sanitizeField(author);
+    p.content = sanitizeContent(content);
     p.time = now();
     p.status = "approved";  // 博客直接发布
     p.reply_count = "0";
@@ -774,6 +1036,8 @@ string renderView(const string& id, const string& lang = "zh") {
             break;
         }
     }
+    // 非公开状态(待审核/已拒绝)的博文详情页一律不可见
+    if (pPtr && pPtr->status != "approved") pPtr = nullptr;
 
     bool en = (lang == "en");
     string tNotFound = en ? "Post not found" : "博客不存在";
@@ -853,7 +1117,7 @@ string doReply(const string& id, const string& author, const string& content, co
 }
 
 // 渲染管理面板
-string renderAdmin(const vector<Post>& posts, const string& lang = "zh", const string& auth = "") {
+string renderAdmin(const vector<Post>& posts, const string& lang = "zh") {
     bool en = (lang == "en");
     string tAdmin = en ? "Admin" : "管理";
     string tAdminPanel = en ? "Blog Admin Panel" : "博客管理面板";
@@ -872,8 +1136,8 @@ string renderAdmin(const vector<Post>& posts, const string& lang = "zh", const s
     string tDelBlogConfirm = en ? "Are you sure you want to delete this blog?" : "确定删除该博客？";
     string tDelCommentConfirm = en ? "Are you sure you want to delete this comment?" : "确定删除该评论？";
 
-    string authParam = auth.empty() ? "" : "&auth=" + auth;
-    string baseParams = "?lang=" + lang + authParam;
+    // 这些链接均已带 "?a=" 查询串，语言参数必须用 & 连接，不能用 ? 二次起头
+    string baseParams = "&lang=" + lang;
 
     stringstream ss;
     ss << "<div class=\"header\">";
@@ -881,8 +1145,8 @@ string renderAdmin(const vector<Post>& posts, const string& lang = "zh", const s
     ss << "<p>" << tAdminPanel << "</p>";
     ss << "</div>";
     ss << "<div class=\"nav\">";
-    ss << "<a href=\"/?lang=" << lang << authParam << "\">" << tBlog << "</a>";
-    ss << "<a href=\"?a=post&lang=" << lang << authParam << "\">" << tWrite << "</a>";
+    ss << "<a href=\"/?lang=" << lang << "\">" << tBlog << "</a>";
+    ss << "<a href=\"?a=post&lang=" << lang << "\">" << tWrite << "</a>";
     ss << "</div>";
 
     // 待审核评论
@@ -942,35 +1206,46 @@ int main() {
     string method = env("REQUEST_METHOD");
     string action = getq(qs, "a");
     string lang = getq(qs, "lang");
-    if (lang.empty()) lang = "en";  // 默认英文
+    // 语言参数白名单：非法值一律回落默认，防止 lang 拼进HTML属性引发反射型XSS
+    if (lang != "zh" && lang != "en") lang = "en";
     if (action.empty()) action = "list";
     
     string langPrefix = (lang == "en") ? "&lang=en" : "";
     
-    // 获取auth参数
-    string auth = getq(qs, "auth");
+    // 统一鉴权：只认服务端会话Cookie，URL里的auth参数不再作为凭据
+    bool authed = isAdminAuthed();
+    string denyMsg = (lang == "en") ? "Not authorized, please sign in first"
+                                    : "未授权操作，请先登录管理账号";
     
     string result;
     vector<Post> posts = loadPosts();
+    
+    // 退出登录：销毁服务端会话并清除Cookie
+    if (action == "logout") {
+        destroySession(getCookieValue("cppblog_sid"));
+        clearSessionCookie();
+        string tTip = (lang == "en") ? "Signed out" : "已退出登录";
+        html("My Blog", lang, "<div class=\"success\">" + tTip + "</div>" + renderList(posts, lang));
+        return 0;
+    }
     
     if (action == "list") {
         result = renderList(posts, lang);
     }
     else if (action == "post") {
-        // 检查是否已验证博客密码
-        string auth = getq(qs, "auth");
-        if (auth == ADMIN_PASSWORD) {
+        // 写博客需要管理员会话
+        if (authed) {
             result = renderPostForm(lang);
         } else {
             result = renderBlogLoginForm("", "blog", lang);
         }
     }
     else if (action == "bloglogin" && method == "POST") {
-        string postData;
-        char c;
-        while (cin.get(c)) postData += c;
+        string postData = readPostBody(MAX_BODY);
         string password = getq(postData, "password");
         if (password == ADMIN_PASSWORD) {
+            destroySession(getCookieValue("cppblog_sid"));   // 轮换旧会话，防范会话固定
+            setSessionCookie(createSession());       // 登录成功，仅下发会话Cookie
             result = renderPostForm(lang);
         } else {
             result = renderBlogLoginForm(lang == "en" ? "Wrong password" : "密码错误", "blog", lang);
@@ -978,121 +1253,113 @@ int main() {
     }
     else if (action == "submit" && method == "POST") {
         // 读取POST数据
-        string postData;
-        char c;
-        while (cin.get(c)) postData += c;
+        string postData = readPostBody(MAX_BODY);
         
-        string title = getq(postData, "title");
-        string author = "";
-        string content = getq(postData, "content");
-        
-        if (!title.empty() && !content.empty()) {
-            result = renderSubmit(title, author, content, lang);
+        if (!authed) {
+            // 发布博客必须鉴权，杜绝任意访客发文
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "blog", lang);
         } else {
-            result = "<div class=\"error\">" + string(lang == "en" ? "Please fill all fields" : "请填写完整信息") + "</div>" + renderPostForm(lang);
+            string title = sanitizeField(getq(postData, "title"));
+            string author = "";
+            string content = getq(postData, "content");
+            if (!title.empty() && !content.empty()) {
+                result = renderSubmit(title, author, content, lang);
+            } else {
+                result = "<div class=\"error\">" + string(lang == "en" ? "Please fill all fields" : "请填写完整信息") + "</div>" + renderPostForm(lang);
+            }
         }
     }
     else if (action == "admin") {
-        // 检查是否已验证
-        string storedAuth = "";
-        const char* envAuth = env("HTTP_COOKIE");
-        if (envAuth) {
-            string cookie = envAuth;
-            size_t p = cookie.find("admin_auth=");
-            if (p != string::npos) {
-                storedAuth = cookie.substr(p + 11, 32);
-            }
-        }
-        
-        // 简单验证：通过URL参数传递
-        if (auth == ADMIN_PASSWORD || storedAuth == ADMIN_PASSWORD) {
-            result = renderAdmin(posts, lang, auth);
+        // 管理面板必须会话鉴权
+        if (authed) {
+            result = renderAdmin(posts, lang);
         } else {
             result = renderBlogLoginForm("", "admin", lang);
         }
     }
-    else if (action == "adminlogin" && method == "POST") {
-        string postData;
-        char c;
-        while (cin.get(c)) postData += c;
+    else if ((action == "adminlogin" || action == "login") && method == "POST") {
+        string postData = readPostBody(MAX_BODY);
         string password = getq(postData, "password");
         if (password == ADMIN_PASSWORD) {
-            result = "<div class=\"success\">" + string(lang == "en" ? "Login success" : "登录成功") + "</div>" + renderAdmin(posts, lang, "verified");
-        } else {
-            result = renderBlogLoginForm(lang == "en" ? "Wrong password" : "密码错误", "admin", lang);
-        }
-    }
-    else if (action == "login" && method == "POST") {
-        string postData;
-        char c;
-        while (cin.get(c)) postData += c;
-        string password = getq(postData, "password");
-        if (password == ADMIN_PASSWORD) {
-            result = "<div class=\"success\">" + string(lang == "en" ? "Login success" : "登录成功") + "</div>" + renderAdmin(posts, lang, "verified");
+            destroySession(getCookieValue("cppblog_sid"));   // 轮换旧会话，防范会话固定
+            setSessionCookie(createSession());       // 下发会话Cookie，密码不再出现在URL/页面中
+            string tTip = (lang == "en") ? "Sign in successful" : "登录成功";
+            result = "<div class=\"success\">" + tTip + "</div>" + renderAdmin(posts, lang);
         } else {
             result = renderBlogLoginForm(lang == "en" ? "Wrong password" : "密码错误", "admin", lang);
         }
     }
     else if (action == "view") {
-        string id = getq(qs, "id");
+        string id = normalizeId(getq(qs, "id"));
         result = renderView(id, lang);
     }
     else if (action == "doreply" && method == "POST") {
-        string id = getq(qs, "id");
-        string postData;
-        char c;
-        while (cin.get(c)) postData += c;
+        string id = normalizeId(getq(qs, "id"));
+        string postData = readPostBody(MAX_BODY);
         string author = getq(postData, "author");
         string content = getq(postData, "content");
         result = doReply(id, author, content, lang);
     }
     else if (action == "approvereply") {
-        string id = getq(qs, "id");
-        approveReply(id);
-        result = "<div class=\"success\">" + string(lang == "en" ? "Comment approved" : "评论已通过审核") + "</div>" + renderAdmin(posts, lang, auth);
+        string id = normalizeId(getq(qs, "id"));
+        string tTip = (lang == "en") ? "Comment approved" : "评论已通过审核";
+        if (authed) {
+            approveReply(id);
+            result = "<div class=\"success\">" + tTip + "</div>" + renderAdmin(loadPosts(), lang);
+        } else {
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "admin", lang);
+        }
     }
     else if (action == "delreply") {
-        string id = getq(qs, "id");
-        deleteReply(id);
-        result = "<div class=\"success\">" + string(lang == "en" ? "Comment deleted" : "评论已删除") + "</div>" + renderAdmin(posts, lang, auth);
+        string id = normalizeId(getq(qs, "id"));
+        string tTip = (lang == "en") ? "Comment deleted" : "评论已删除";
+        if (authed) {
+            deleteReply(id);
+            result = "<div class=\"success\">" + tTip + "</div>" + renderAdmin(loadPosts(), lang);
+        } else {
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "admin", lang);
+        }
     }
     else if (action == "edit") {
-        string id = getq(qs, "id");
-        result = renderEditForm(id, lang);
+        string id = normalizeId(getq(qs, "id"));
+        if (authed) {
+            result = renderEditForm(id, lang);
+        } else {
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "admin", lang);
+        }
     }
     else if (action == "update" && method == "POST") {
-        string postData;
-        char c;
-        while (cin.get(c)) postData += c;
-        string id = getq(postData, "id");
-        string title = getq(postData, "title");
-        string content = getq(postData, "content");
-        updatePost(id, title, content);
-        result = "<div class=\"success\">" + string(lang == "en" ? "Blog updated!" : "博客已更新！") + "</div><div style=\"text-align:center;margin-top:20px;\"><a href=\"/?lang=" + lang + "\">" + (lang == "en" ? "< Back to Blog" : "← 返回博客") + "</a></div>";
+        string postData = readPostBody(MAX_BODY);
+        if (authed) {
+            string id = normalizeId(getq(postData, "id"));
+            string title = sanitizeField(getq(postData, "title"));
+            string content = getq(postData, "content");
+            updatePost(id, title, content);
+            result = "<div class=\"success\">" + string(lang == "en" ? "Blog updated!" : "博客已更新！") + "</div><div style=\"text-align:center;margin-top:20px;\"><a href=\"/?lang=" + lang + "\">" + (lang == "en" ? "< Back to Blog" : "← 返回博客") + "</a></div>";
+        } else {
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "admin", lang);
+        }
     }
     else if (action == "delblog") {
-        string id = getq(qs, "id");
-        deleteBlog(id);
-        posts = loadPosts();
-        result = "<div class=\"success\">" + string(lang == "en" ? "Blog deleted" : "博客已删除") + "</div>" + renderAdmin(posts, lang, auth);
+        string id = normalizeId(getq(qs, "id"));
+        string tTip = (lang == "en") ? "Blog deleted" : "博客已删除";
+        if (authed) {
+            deleteBlog(id);
+            posts = loadPosts();
+            result = "<div class=\"success\">" + tTip + "</div>" + renderAdmin(posts, lang);
+        } else {
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "admin", lang);
+        }
     }
     else if (action == "deleteall" && method == "POST") {
-        // 验证权限
-        string storedAuth = "";
-        const char* envAuth = env("HTTP_COOKIE");
-        if (envAuth) {
-            string cookie = envAuth;
-            size_t p = cookie.find("admin_auth=");
-            if (p != string::npos) {
-                storedAuth = cookie.substr(p + 11, 32);
-            }
-        }
-        if (auth == ADMIN_PASSWORD || storedAuth == ADMIN_PASSWORD) {
+        // 清库：严格会话鉴权
+        if (authed) {
             deleteAllPosts();
             posts = loadPosts();
-            result = "<div class=\"success\">" + string(lang == "en" ? "All blogs deleted" : "所有博客已删除") + "</div>" + renderAdmin(posts, lang, auth);
+            string tTip = (lang == "en") ? "All blogs deleted" : "所有博客已删除";
+            result = "<div class=\"success\">" + tTip + "</div>" + renderAdmin(posts, lang);
         } else {
-            result = renderBlogLoginForm(lang == "en" ? "Unauthorized" : "未授权", "admin", lang);
+            result = "<div class=\"error\">" + denyMsg + "</div>" + renderBlogLoginForm("", "admin", lang);
         }
     }
     else {
